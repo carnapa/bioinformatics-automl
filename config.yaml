@@ -1,0 +1,56 @@
+# YAML file for configuration
+
+project_name: "Analisis_Bioinformatico_01"
+
+# 1. Data
+data:
+  raw_path: "data/data_breast_cancer.csv"        # Input data
+  target_column: "diagnosis"          # Target variable (for prediction)
+  index_column: "id"           # Index column name for samples if it exists (to not treat it as a variable)
+  drop_columns: ["Unnamed: 32"]    # Columns to be excluded from analysis
+
+# 2. Processing parameters
+preprocessing:
+  log_transform: true                 # Nomalisation
+  scaling: "standard"                 # Scaling options: standard, minmax, robust
+  impute_missing: "median"            # Input missing data as (mean, median, zero)
+  test_size: 0.2                      # Train test partition size
+
+# 3. Exploratory analisis (EDA)
+eda:
+  correlation_threshold: 0.9          # Correlation threshold
+  top_n_features: 20                  # Max features to be included
+  top_n_categories: 20                # Max categories to be included
+  generate_pca: true                  # Option to use PCA
+  pca_components: 3                   # Total components to calculate
+
+# 4. Models to be trained
+models:
+  - "random_forest"
+  - "logistic_regression"
+  - "svm"
+  - "knn"
+
+# 4b. Model training settings
+model_training:
+  task_type: "auto"                # auto, classification, regression
+  cv_folds: 5                     # Cross-validation folds
+  scoring_metric: "f1_weighted"   # Classification: accuracy, f1_weighted, roc_auc | Regression: r2, neg_mean_squared_error
+  use_tuning: true                # Enable/disable hyperparameter tuning (GridSearchCV)
+  # hyperparameters:              # Optional: override default grids per model
+  #   random_forest:
+  #     n_estimators: [50, 100, 200]
+  #     max_depth: [null, 10, 20]
+  #   logistic_regression:
+  #     C: [0.01, 0.1, 1, 10]
+  #   svm:
+  #     C: [0.1, 1, 10]
+  #     kernel: ["rbf", "linear"]
+  #   knn:
+  #     n_neighbors: [3, 5, 7, 11]
+
+# 5. Output
+output:
+  dir: "results/"
+  save_plots: true
+  save_models: true

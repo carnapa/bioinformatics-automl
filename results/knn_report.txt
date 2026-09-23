@@ -1,0 +1,10 @@
+Classification Report: knn
+==================================================
+              precision    recall  f1-score   support
+
+           B       0.95      1.00      0.97        72
+           M       1.00      0.90      0.95        42
+
+    accuracy                           0.96       114
+   macro avg       0.97      0.95      0.96       114
+weighted avg       0.97      0.96      0.96       114
