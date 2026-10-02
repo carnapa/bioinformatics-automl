@@ -113,7 +113,7 @@ def _load_sample_dataset():
         loaded_df.set(df)
         ui.notification_show("Loaded sample Breast Cancer dataset!", type="message", duration=3)
     else:
-        ui.notification_show("Sample file 'docs/data/data_breast_cancer.csv' not found.", type="error")
+        ui.notification_show("Sample file 'data/data_breast_cancer.csv' not found.", type="error")
 
 
 @reactive.effect
