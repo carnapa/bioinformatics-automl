@@ -213,5 +213,3 @@ data/*.gz
 
 # Dont ignore the file .gitkeep to preservethe folder data/
 !data/.gitkeep
-# Dont ignore the sample dataset for demo purposes
-!data/data_breast_cancer.csv
