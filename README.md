@@ -107,12 +107,6 @@ All settings for the headless CLI pipeline live in [`config.yaml`](config.yaml):
 
 ---
 
-## Data
-
-The included sample dataset is the [Wisconsin Breast Cancer Diagnostic Dataset (WBCD)](https://doi.org/10.24432/C5DW2B), donated by Wolberg, W., Mangasarian, O., Street, N., & Street, W. (1995) to the UCI Machine Learning Repository. Licensed under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/).
-
----
-
 ## License
 
 [MIT](LICENSE)
