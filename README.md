@@ -20,13 +20,13 @@ A config-driven machine learning pipeline and interactive web dashboard for bioi
 
 ```
 bioinformatics-automl/
-├── app.py               # 🌐 Interactive Shiny Express Web App
-├── main.py              # ⚙️ Headless CLI pipeline entry point
+├── app.py               # Interactive Shiny Express Web App
+├── main.py              # Headless CLI pipeline entry point
 ├── config.yaml          # All pipeline settings
 ├── requirements.txt     # Python dependencies
 ├── data/                # Input datasets
 ├── results/             # Generated outputs (plots, reports, models)
-├── docs/                # 🚀 Static Shinylive WebAssembly build (GitHub Pages)
+├── docs/                # Static Shinylive WebAssembly build (GitHub Pages)
 ├── src/
 │   ├── utils.py         # Config & data loading utilities
 │   ├── eda.py           # Exploratory data analysis module
