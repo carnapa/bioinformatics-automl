@@ -105,7 +105,7 @@ with ui.sidebar(width=340, bg="#f8f9fa", title="Pipeline Controls"):
 @reactive.effect
 @reactive.event(input.load_sample_btn)
 def _load_sample_dataset():
-    path = Path("data/data_breast_cancer.csv")
+    path = Path(__file__).parent / "data" / "data_breast_cancer.csv"
     if path.exists():
         df = pd.read_csv(path)
         if "id" in df.columns:

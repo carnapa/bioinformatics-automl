@@ -206,10 +206,10 @@ marimo/_static/
 marimo/_lsp/
 __marimo__/
 
-# Ignore datasets
+# Ignore local datasets
 data/*.csv
 data/*.xlsx
 data/*.gz
 
-# Dont ignore the file .gitkeep to preservethe folder data/
-!data/.gitkeep
+# Dont ignore the file dataset data_breast_cancer.csv also to preservethe folder data/
+!data/data_breast_cancer.csv
