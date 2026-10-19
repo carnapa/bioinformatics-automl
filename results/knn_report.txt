@@ -1,5 +1,3 @@
-Classification Report: knn
-==================================================
               precision    recall  f1-score   support
 
            B       0.95      1.00      0.97        72

@@ -15,21 +15,24 @@ def main() -> None:
     if not config:
         return
 
-  
     try:
-        # Loading data
+        # 1. Loading data
         df = load_data(config)
     
         # Previewing data
         logger.info("Data Preview (first 5 rows):")
         logger.info(f"\n{df.head()}")
 
-        # Droping unwanted columns
+        # 2. Dropping unwanted columns
         df = drop_unwanted_columns(df, config)
         
         # 3. Running EDA
         if config['eda']['generate_pca'] or config['output']['save_plots']:
             run_eda(df, config)
+            
+        # 4. Running Model Training (AutoML)
+        if config.get('models'):
+            run_model_training(df, config)
             
         logger.info("Pipeline execution finished.")
         
