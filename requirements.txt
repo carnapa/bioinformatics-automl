@@ -6,3 +6,9 @@ matplotlib
 joblib
 shiny
 shinyswatch
+# --- RNA-Seq & Deep Learning dependencies ---
+numpy
+scipy
+statsmodels
+torch
+gseapy

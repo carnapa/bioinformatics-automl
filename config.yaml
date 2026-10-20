@@ -54,3 +54,29 @@ output:
   dir: "results/"
   save_plots: true
   save_models: true
+
+# 6. RNA-Seq pipeline settings
+rnaseq:
+  enabled: false                       # Set to true to activate the RNA-Seq pipeline
+  count_data_path: "data/counts.csv"   # Raw count matrix: samples as rows, genes as columns
+  metadata_path: "data/metadata.csv"   # Sample metadata CSV with a condition column
+  target_col: "condition"              # Column in metadata used to define groups
+  min_cpm: 1.0                         # CPM threshold for low-expression gene filtering
+  min_samples: 3                       # Min samples that must meet the CPM threshold
+  log2fc_thresh: 1.0                   # Absolute log2 fold-change cutoff for DEA significance
+  fdr_thresh: 0.05                     # Benjamini-Hochberg adjusted p-value cutoff
+  group_a: "Control"                   # Reference group label (denominator of log2FC)
+  group_b: "Treated"                   # Comparison group label (numerator of log2FC)
+  enrichment_db: "KEGG_2021_Human"     # gseapy Enrichr library name for ORA (set to "" to skip)
+
+# 7. PyTorch deep learning settings
+deep_learning:
+  enabled: false                       # Set to true to activate DL (requires rnaseq.enabled: true)
+  model_type: "mlp"                    # Options: mlp (supervised) | vae (unsupervised dim. reduction)
+  hidden_dims: [512, 256, 128]         # Hidden layer sizes for MLP; encoder dims for VAE
+  latent_dim: 32                       # Latent space dimensions (VAE only)
+  epochs: 100                          # Maximum training epochs
+  learning_rate: 0.001                 # Adam optimiser learning rate
+  dropout: 0.3                         # Dropout probability (MLP only)
+  batch_size: 32                       # Mini-batch size
+  early_stopping_patience: 10          # MLP: epochs without val-loss improvement before stopping

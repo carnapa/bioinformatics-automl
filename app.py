@@ -2,9 +2,16 @@ import io
 import asyncio
 import zipfile
 from pathlib import Path
+
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 import joblib
+import torch
 import shinyswatch
+from sklearn.decomposition import PCA
 from shiny import reactive
 from shiny.express import input, render, ui
 
@@ -14,7 +21,12 @@ from src.eda import (
     generate_correlation_heatmap,
     generate_pca_plots,
 )
-from src.models import run_model_training
+from src.automl_models import run_model_training
+from src.bio.rnaseq import RNASeqPipeline
+from src.models.dl_expression import (
+    ExpressionMLP, ExpressionTrainer,
+    ExpressionVAE, VAETrainer,
+)
 
 # Set page title and theme
 ui.page_opts(
@@ -28,8 +40,12 @@ ui.page_opts(
 # ---------------------------------------------------------------------------
 loaded_df = reactive.value(None)
 
+# Reactive state for the Transcriptomics tab — shared between both new tabs
+rnaseq_counts_df   = reactive.value(None)   # raw count matrix (DataFrame)
+rnaseq_metadata_df = reactive.value(None)   # sample metadata (DataFrame)
+
 # ---------------------------------------------------------------------------
-# Section 5: Non-Blocking Model Training (Extended Task)
+# Extended Task 1: AutoML sklearn model training (unchanged)
 # ---------------------------------------------------------------------------
 @reactive.extended_task
 async def train_models_task(df: pd.DataFrame, config: dict):
@@ -49,7 +65,7 @@ def training_results():
 
 @reactive.effect
 def _handle_task_notifications():
-    """Display toast notifications on task state changes."""
+    """Display toast notifications on AutoML task state changes."""
     status = train_models_task.status()
     if status == "running":
         ui.notification_show("Model training in progress with cross-validation...", duration=6, type="message")
@@ -60,7 +76,215 @@ def _handle_task_notifications():
 
 
 # ---------------------------------------------------------------------------
-# Sidebar Layout
+# Extended Task 2: RNA-Seq analysis (normalise + DEA + plots)
+# ---------------------------------------------------------------------------
+
+def _run_rnaseq(counts_df, metadata_df, target_col, group_a, group_b,
+                log2fc_thresh, fdr_thresh):
+    """
+    Synchronous RNA-Seq worker — runs in a thread pool executor.
+
+    Returns a dict with keys:
+        dea_df       : pd.DataFrame  — full DEA results table
+        volcano_fig  : Figure        — volcano plot
+        ma_fig       : Figure        — MA plot
+        log_cpm      : pd.DataFrame  — normalised expression matrix
+        metadata     : pd.DataFrame  — aligned sample metadata
+    """
+    pipe = RNASeqPipeline(counts_df, metadata_df, target_col=target_col)
+    pipe.normalize_counts()
+
+    dea_df = pipe.run_dea(
+        group_a=group_a,
+        group_b=group_b,
+        fdr_thresh=fdr_thresh,
+        log2fc_thresh=log2fc_thresh,
+    )
+
+    volcano_fig = pipe.plot_volcano(dea_df, log2fc_thresh=log2fc_thresh, fdr_thresh=fdr_thresh)
+    ma_fig      = pipe.plot_ma(dea_df, fdr_thresh=fdr_thresh)
+
+    return {
+        "dea_df":      dea_df,
+        "volcano_fig": volcano_fig,
+        "ma_fig":      ma_fig,
+        "log_cpm":     pipe.log_cpm,
+        "metadata":    pipe.metadata,
+    }
+
+
+@reactive.extended_task
+async def rnaseq_task(counts_df, metadata_df, target_col, group_a, group_b,
+                      log2fc_thresh, fdr_thresh):
+    """Offloads RNA-Seq normalisation + DEA to a background worker thread."""
+    loop = asyncio.get_running_loop()
+    result = await loop.run_in_executor(
+        None, _run_rnaseq,
+        counts_df, metadata_df, target_col, group_a, group_b,
+        log2fc_thresh, fdr_thresh,
+    )
+    return result
+
+
+@reactive.calc
+def rnaseq_results():
+    """Return RNA-Seq task result dict when the task completes successfully."""
+    if rnaseq_task.status() == "success":
+        return rnaseq_task.result()
+    return None
+
+
+@reactive.effect
+def _handle_rnaseq_notifications():
+    """Display toast notifications on RNA-Seq task state changes."""
+    status = rnaseq_task.status()
+    if status == "running":
+        ui.notification_show("RNA-Seq analysis in progress...", duration=6, type="message")
+    elif status == "success":
+        res = rnaseq_task.result()
+        n_sig = int(res["dea_df"]["significant"].sum())
+        ui.notification_show(
+            f"RNA-Seq analysis complete! {n_sig} significant genes found.",
+            duration=5, type="message"
+        )
+    elif status == "error":
+        ui.notification_show(
+            f"RNA-Seq analysis failed: {rnaseq_task.error()}",
+            duration=None, type="error"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Extended Task 3: PyTorch DL training (MLP or VAE)
+# ---------------------------------------------------------------------------
+
+def _run_dl(log_cpm, metadata, target_col, group_b,
+            model_type, hidden_dims, latent_dim,
+            epochs, lr, dropout, batch_size, patience):
+    """
+    Synchronous PyTorch training worker — runs in a thread pool executor.
+
+    Returns a dict with keys (varies by model_type):
+        model_type   : str
+        curves_fig   : Figure    — training loss curves
+        model_bytes  : bytes     — serialised .pt state dict
+        eval_metrics : dict      — {loss, accuracy} or {loss, r2}  [MLP only]
+        latent_fig   : Figure    — VAE PCA scatter plot             [VAE only]
+    """
+    X_arr    = log_cpm.values.astype("float32")
+    input_dim = X_arr.shape[1]
+
+    result = {"model_type": model_type}
+
+    if model_type == "mlp":
+        # Binary label: group_b = 1, everything else = 0
+        y_arr = (metadata[target_col] == group_b).astype(int).loc[log_cpm.index].values
+
+        split = max(1, int(len(X_arr) * 0.8))
+        X_train, X_val = X_arr[:split], X_arr[split:]
+        y_train, y_val = y_arr[:split], y_arr[split:]
+
+        model   = ExpressionMLP(
+            input_dim=input_dim,
+            hidden_dims=hidden_dims,
+            num_classes=2,
+            dropout_rate=dropout,
+        )
+        trainer = ExpressionTrainer(model, task="classification")
+        history = trainer.fit(
+            X_train, y_train, X_val, y_val,
+            epochs=epochs, lr=lr, batch_size=batch_size, patience=patience,
+        )
+
+        result["curves_fig"]   = trainer.plot_training_curves(history)
+        result["eval_metrics"] = trainer.evaluate(X_val, y_val)
+
+        buf = io.BytesIO()
+        torch.save(model.state_dict(), buf)
+        result["model_bytes"] = buf.getvalue()
+
+    elif model_type == "vae":
+        vae     = ExpressionVAE(input_dim=input_dim, hidden_dims=hidden_dims,
+                                latent_dim=latent_dim)
+        trainer = VAETrainer(vae)
+        history = trainer.fit_vae(
+            X_arr, epochs=epochs, lr=lr, batch_size=batch_size,
+        )
+
+        result["curves_fig"] = trainer.plot_training_curves(history)
+
+        # PCA projection of latent mu vectors, coloured by condition
+        mu_vecs  = trainer.transform(X_arr)
+        pca      = PCA(n_components=2)
+        coords   = pca.fit_transform(mu_vecs)
+        conditions = metadata[target_col].values
+        unique_conds = np.unique(conditions)
+        colours  = plt.cm.tab10(np.linspace(0, 0.5, len(unique_conds)))
+
+        fig, ax = plt.subplots(figsize=(7, 5))
+        for cond, col in zip(unique_conds, colours):
+            mask = conditions == cond
+            ax.scatter(coords[mask, 0], coords[mask, 1],
+                       label=cond, c=[col], alpha=0.8, s=60,
+                       edgecolors='k', linewidths=0.4)
+        ev = pca.explained_variance_ratio_ * 100
+        ax.set_xlabel(f"PC1 ({ev[0]:.1f}%)")
+        ax.set_ylabel(f"PC2 ({ev[1]:.1f}%)")
+        ax.set_title("VAE Latent Space — PCA Projection")
+        ax.legend(title=target_col, framealpha=0.8)
+        fig.tight_layout()
+        result["latent_fig"] = fig
+
+        buf = io.BytesIO()
+        torch.save(vae.state_dict(), buf)
+        result["model_bytes"] = buf.getvalue()
+
+    else:
+        raise ValueError(f"Unknown model_type '{model_type}'. Use 'mlp' or 'vae'.")
+
+    return result
+
+
+@reactive.extended_task
+async def dl_task(log_cpm, metadata, target_col, group_b,
+                  model_type, hidden_dims, latent_dim,
+                  epochs, lr, dropout, batch_size, patience):
+    """Offloads PyTorch model training to a background worker thread."""
+    loop = asyncio.get_running_loop()
+    result = await loop.run_in_executor(
+        None, _run_dl,
+        log_cpm, metadata, target_col, group_b,
+        model_type, hidden_dims, latent_dim,
+        epochs, lr, dropout, batch_size, patience,
+    )
+    return result
+
+
+@reactive.calc
+def dl_results():
+    """Return DL task result dict when training completes successfully."""
+    if dl_task.status() == "success":
+        return dl_task.result()
+    return None
+
+
+@reactive.effect
+def _handle_dl_notifications():
+    """Display toast notifications on DL task state changes."""
+    status = dl_task.status()
+    if status == "running":
+        ui.notification_show("PyTorch model training in progress...", duration=6, type="message")
+    elif status == "success":
+        ui.notification_show("PyTorch training complete!", duration=5, type="message")
+    elif status == "error":
+        ui.notification_show(
+            f"PyTorch training failed: {dl_task.error()}",
+            duration=None, type="error"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Sidebar Layout (unchanged)
 # ---------------------------------------------------------------------------
 with ui.sidebar(width=340, bg="#f8f9fa", title="Pipeline Controls"):
     ui.h5("1. Data Input")
@@ -100,7 +324,7 @@ with ui.sidebar(width=340, bg="#f8f9fa", title="Pipeline Controls"):
 
 
 # ---------------------------------------------------------------------------
-# Data Loading & Event Handlers
+# Data Loading & Event Handlers (unchanged)
 # ---------------------------------------------------------------------------
 @reactive.effect
 @reactive.event(input.load_sample_btn)
@@ -162,7 +386,7 @@ def cleaned_df():
 
 
 # ---------------------------------------------------------------------------
-# Training Trigger (Invokes Extended Task)
+# Training Trigger — AutoML (unchanged)
 # ---------------------------------------------------------------------------
 @reactive.effect
 @reactive.event(input.train_btn)
@@ -212,7 +436,7 @@ def _trigger_training():
 
 
 # ---------------------------------------------------------------------------
-# Section 6: Helper for Zip Results Bundle & Model Downloads
+# Helper for Zip Results Bundle & Model Downloads (unchanged)
 # ---------------------------------------------------------------------------
 def _create_results_zip(results, df=None) -> bytes:
     """Creates an in-memory zip file containing all reports, plots, models, and CSVs."""
@@ -262,11 +486,151 @@ def _get_model_joblib_bytes(model_name: str) -> bytes:
 
 
 # ---------------------------------------------------------------------------
+# Transcriptomics tab — reactive event handlers
+# ---------------------------------------------------------------------------
+
+@reactive.effect
+@reactive.event(input.rna_counts_upload)
+def _handle_counts_upload():
+    """Load uploaded count matrix CSV into reactive state."""
+    file_info = input.rna_counts_upload()
+    if not file_info:
+        return
+    try:
+        df = pd.read_csv(Path(file_info[0]["datapath"]), index_col=0)
+        rnaseq_counts_df.set(df)
+        ui.notification_show(
+            f"Count matrix loaded: {df.shape[0]} rows × {df.shape[1]} columns.",
+            type="message", duration=3
+        )
+    except Exception as e:
+        ui.notification_show(f"Error reading count matrix: {e}", type="error")
+
+
+@reactive.effect
+@reactive.event(input.rna_metadata_upload)
+def _handle_metadata_upload():
+    """Load uploaded metadata CSV and populate the condition column dropdown."""
+    file_info = input.rna_metadata_upload()
+    if not file_info:
+        return
+    try:
+        df = pd.read_csv(Path(file_info[0]["datapath"]), index_col=0)
+        rnaseq_metadata_df.set(df)
+        cols = list(df.columns)
+        ui.update_select("rna_condition_col", choices=cols,
+                         selected=cols[0] if cols else None)
+        ui.notification_show(
+            f"Metadata loaded: {df.shape[0]} samples, columns: {cols}.",
+            type="message", duration=3
+        )
+    except Exception as e:
+        ui.notification_show(f"Error reading metadata: {e}", type="error")
+
+
+@reactive.effect
+def _sync_group_selectors():
+    """Populate Group A / Group B dropdowns from the selected condition column."""
+    meta = rnaseq_metadata_df()
+    try:
+        col = input.rna_condition_col()
+    except Exception:
+        col = None
+    if meta is None or not col or col not in meta.columns:
+        return
+    unique_vals = sorted(meta[col].dropna().unique().tolist())
+    sel_a = unique_vals[0] if len(unique_vals) > 0 else None
+    sel_b = unique_vals[1] if len(unique_vals) > 1 else sel_a
+    ui.update_select("rna_group_a", choices=unique_vals, selected=sel_a)
+    ui.update_select("rna_group_b", choices=unique_vals, selected=sel_b)
+
+
+@reactive.effect
+@reactive.event(input.rna_run_btn)
+def _trigger_rnaseq():
+    """Validate inputs and launch the RNA-Seq background task."""
+    counts = rnaseq_counts_df()
+    meta   = rnaseq_metadata_df()
+    if counts is None:
+        ui.notification_show("Please upload a count matrix CSV first.", type="warning")
+        return
+    if meta is None:
+        ui.notification_show("Please upload a metadata CSV first.", type="warning")
+        return
+
+    target_col = input.rna_condition_col()
+    group_a    = input.rna_group_a()
+    group_b    = input.rna_group_b()
+
+    if not target_col or not group_a or not group_b:
+        ui.notification_show("Please select condition column, Group A, and Group B.", type="warning")
+        return
+    if group_a == group_b:
+        ui.notification_show("Group A and Group B must be different.", type="warning")
+        return
+
+    rnaseq_task(
+        counts, meta, target_col, group_a, group_b,
+        float(input.rna_log2fc_thresh()),
+        float(input.rna_fdr_thresh()),
+    )
+
+
+# ---------------------------------------------------------------------------
+# PyTorch DL tab — reactive event handler
+# ---------------------------------------------------------------------------
+
+@reactive.effect
+@reactive.event(input.dl_train_btn)
+def _trigger_dl_training():
+    """Validate RNA-Seq results and launch the DL background task."""
+    rna_res = rnaseq_results()
+    if rna_res is None:
+        ui.notification_show(
+            "Run RNA-Seq analysis first (Transcriptomics & DEA tab).", type="warning"
+        )
+        return
+
+    log_cpm  = rna_res["log_cpm"]
+    metadata = rna_res["metadata"]
+
+    # Parse hidden_dims from the comma-separated text input
+    try:
+        hidden_dims = [int(x.strip()) for x in input.dl_hidden_dims().split(",") if x.strip()]
+        if not hidden_dims:
+            raise ValueError("Empty list")
+    except Exception:
+        ui.notification_show(
+            "Hidden Dims must be comma-separated integers, e.g. '512,256,128'.", type="warning"
+        )
+        return
+
+    model_type = input.dl_model_type()
+
+    # Determine target_col and group_b from the RNA-Seq inputs
+    target_col = input.rna_condition_col()
+    group_b    = input.rna_group_b()
+
+    dl_task(
+        log_cpm, metadata, target_col, group_b,
+        model_type, hidden_dims,
+        int(input.dl_latent_dim()),
+        int(input.dl_epochs()),
+        float(input.dl_lr()),
+        float(input.dl_dropout()),
+        int(input.dl_batch_size()),
+        int(input.dl_patience()),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Main Tabs Layout
 # ---------------------------------------------------------------------------
 with ui.navset_card_tab(id="main_tabs"):
 
-    # TAB 1: DATA PREVIEW & SUMMARY
+    # ------------------------------------------------------------------
+    # TAB 1: DATA PREVIEW & SUMMARY (unchanged)
+    # ------------------------------------------------------------------
     with ui.nav_panel("Data Preview & Stats"):
         with ui.layout_columns(col_widths=[12]):
             with ui.card():
@@ -288,7 +652,9 @@ with ui.navset_card_tab(id="main_tabs"):
                     summary_df = generate_summary(df).reset_index().rename(columns={"index": "feature"})
                     return render.DataGrid(summary_df, height="350px", width="100%")
 
-    # TAB 2: EXPLORATORY DATA ANALYSIS (EDA)
+    # ------------------------------------------------------------------
+    # TAB 2: EXPLORATORY DATA ANALYSIS (unchanged)
+    # ------------------------------------------------------------------
     with ui.nav_panel("Exploratory Data Analysis"):
         with ui.layout_columns(col_widths=[6, 6]):
             with ui.card():
@@ -321,7 +687,9 @@ with ui.navset_card_tab(id="main_tabs"):
                 plots, _ = generate_pca_plots(df, target=target, n_components=2, impute_strategy=input.impute_missing())
                 return plots.get("pca_PC1_vs_PC2")
 
-    # TAB 3: MODEL TRAINING & EVALUATION
+    # ------------------------------------------------------------------
+    # TAB 3: MODEL TRAINING & EVALUATION (unchanged)
+    # ------------------------------------------------------------------
     with ui.nav_panel("Models & Leaderboard"):
         with ui.card():
             ui.card_header("Model Comparison Leaderboard")
@@ -337,10 +705,7 @@ with ui.navset_card_tab(id="main_tabs"):
                 return render.DataGrid(pd.DataFrame(summary_rows), width="100%")
 
             with ui.layout_columns(col_widths=[6, 6]):
-                @render.download_button(
-                    filename="model_comparison.csv",
-                    label="Download Comparison CSV"
-                )
+                @render.download(filename="model_comparison.csv")
                 async def download_comparison():
                     results = training_results()
                     if results:
@@ -351,10 +716,7 @@ with ui.navset_card_tab(id="main_tabs"):
                         df = pd.DataFrame(summary_rows)
                         yield df.to_csv(index=False)
 
-                @render.download_button(
-                    filename="bioinformatics_automl_results.zip",
-                    label="Download Full Results Bundle (.zip)"
-                )
+                @render.download(filename="bioinformatics_automl_results.zip")
                 async def download_bundle():
                     results = training_results()
                     df = cleaned_df()
@@ -371,10 +733,7 @@ with ui.navset_card_tab(id="main_tabs"):
                 @render.text
                 def rf_report():
                     return _get_report("random_forest")
-                @render.download_button(
-                    filename="random_forest_model.joblib",
-                    label="Download Random Forest Model (.joblib)"
-                )
+                @render.download(filename="random_forest_model.joblib")
                 async def download_rf_model():
                     yield _get_model_joblib_bytes("random_forest")
                 with ui.layout_columns(col_widths=[4, 4, 4]):
@@ -395,10 +754,7 @@ with ui.navset_card_tab(id="main_tabs"):
                 @render.text
                 def lr_report():
                     return _get_report("logistic_regression")
-                @render.download_button(
-                    filename="logistic_regression_model.joblib",
-                    label="Download Logistic Regression Model (.joblib)"
-                )
+                @render.download(filename="logistic_regression_model.joblib")
                 async def download_lr_model():
                     yield _get_model_joblib_bytes("logistic_regression")
                 with ui.layout_columns(col_widths=[4, 4, 4]):
@@ -419,10 +775,7 @@ with ui.navset_card_tab(id="main_tabs"):
                 @render.text
                 def svm_report():
                     return _get_report("svm")
-                @render.download_button(
-                    filename="svm_model.joblib",
-                    label="Download SVM Model (.joblib)"
-                )
+                @render.download(filename="svm_model.joblib")
                 async def download_svm_model():
                     yield _get_model_joblib_bytes("svm")
                 with ui.layout_columns(col_widths=[4, 4, 4]):
@@ -443,10 +796,7 @@ with ui.navset_card_tab(id="main_tabs"):
                 @render.text
                 def knn_report():
                     return _get_report("knn")
-                @render.download_button(
-                    filename="knn_model.joblib",
-                    label="Download KNN Model (.joblib)"
-                )
+                @render.download(filename="knn_model.joblib")
                 async def download_knn_model():
                     yield _get_model_joblib_bytes("knn")
                 with ui.layout_columns(col_widths=[4, 4, 4]):
@@ -460,9 +810,217 @@ with ui.navset_card_tab(id="main_tabs"):
                     def knn_fi():
                         return _get_figure("knn", "feature_importance")
 
+    # ------------------------------------------------------------------
+    # TAB 4: TRANSCRIPTOMICS & DEA  (new)
+    # ------------------------------------------------------------------
+    with ui.nav_panel("Transcriptomics & DEA"):
+
+        # Control panel — inputs at the top of the tab
+        with ui.card(class_="mb-3"):
+            ui.card_header("RNA-Seq Analysis Controls")
+            with ui.layout_columns(col_widths=[3, 3, 3, 3]):
+                ui.input_file(
+                    "rna_counts_upload",
+                    "Count Matrix CSV",
+                    accept=[".csv"],
+                    multiple=False,
+                )
+                ui.input_file(
+                    "rna_metadata_upload",
+                    "Sample Metadata CSV",
+                    accept=[".csv"],
+                    multiple=False,
+                )
+                ui.input_select(
+                    "rna_condition_col",
+                    "Condition Column",
+                    choices=[],
+                )
+                ui.div()   # spacer
+
+            with ui.layout_columns(col_widths=[3, 3, 3, 3]):
+                ui.input_select("rna_group_a", "Group A (Reference)", choices=[])
+                ui.input_select("rna_group_b", "Group B (Comparison)", choices=[])
+                ui.input_slider(
+                    "rna_log2fc_thresh", "Log2FC Threshold",
+                    min=0.0, max=3.0, value=1.0, step=0.1,
+                )
+                ui.input_slider(
+                    "rna_fdr_thresh", "FDR Threshold",
+                    min=0.01, max=0.20, value=0.05, step=0.01,
+                )
+
+            ui.input_task_button(
+                "rna_run_btn",
+                "Run RNA-Seq Analysis",
+                class_="btn-primary mt-2",
+            )
+
+        # Output panels
+        with ui.layout_columns(col_widths=[6, 6]):
+            with ui.card():
+                ui.card_header("Volcano Plot")
+                @render.plot
+                def plot_volcano():
+                    res = rnaseq_results()
+                    if res is None:
+                        return None
+                    return res["volcano_fig"]
+
+            with ui.card():
+                ui.card_header("MA Plot")
+                @render.plot
+                def plot_ma():
+                    res = rnaseq_results()
+                    if res is None:
+                        return None
+                    return res["ma_fig"]
+
+        with ui.card():
+            ui.card_header("Top Differentially Expressed Genes (Top 50 by Adjusted p-value)")
+
+            @render.data_frame
+            def dea_table():
+                res = rnaseq_results()
+                if res is None:
+                    return None
+                top50 = (
+                    res["dea_df"]
+                    .sort_values("adj_p_value")
+                    .head(50)
+                    .reset_index(drop=True)
+                )
+                return render.DataGrid(top50, height="350px", width="100%")
+
+            @render.download(filename="dea_results.csv")
+            async def download_dea():
+                """Download the full DEA results table as CSV."""
+                res = rnaseq_results()
+                if res is not None:
+                    yield res["dea_df"].to_csv(index=False)
+
+    # ------------------------------------------------------------------
+    # TAB 5: PYTORCH EXPRESSION DL  (new)
+    # ------------------------------------------------------------------
+    with ui.nav_panel("PyTorch Expression DL"):
+
+        # Status message when RNA-Seq has not been run yet
+        @render.ui
+        def dl_prereq_notice():
+            if rnaseq_results() is None:
+                return ui.div(
+                    ui.tags.div(
+                        ui.tags.strong("RNA-Seq analysis required. "),
+                        "Please run the ",
+                        ui.tags.em("Transcriptomics & DEA"),
+                        " analysis first — this tab uses the normalised "
+                        "expression matrix produced there.",
+                        class_="alert alert-info",
+                    )
+                )
+            rna = rnaseq_results()
+            n_genes   = rna["log_cpm"].shape[1]
+            n_samples = rna["log_cpm"].shape[0]
+            return ui.div(
+                ui.tags.div(
+                    ui.tags.strong("Ready. "),
+                    f"Normalised expression matrix: {n_samples} samples × {n_genes} genes.",
+                    class_="alert alert-success",
+                )
+            )
+
+        # Control panel
+        with ui.card(class_="mb-3"):
+            ui.card_header("PyTorch Model Controls")
+
+            with ui.layout_columns(col_widths=[4, 4, 4]):
+                ui.input_select(
+                    "dl_model_type",
+                    "Model Type",
+                    choices={
+                        "mlp": "MLP Classifier",
+                        "vae": "VAE Dimensionality Reduction",
+                    },
+                    selected="mlp",
+                )
+                ui.input_text(
+                    "dl_hidden_dims",
+                    "Hidden Layer Dims (comma-separated)",
+                    value="512,256,128",
+                )
+                ui.input_numeric(
+                    "dl_latent_dim",
+                    "Latent Dimensions (VAE only)",
+                    value=32, min=2, max=256,
+                )
+
+            with ui.layout_columns(col_widths=[3, 3, 3, 3]):
+                ui.input_numeric("dl_epochs",     "Epochs",              value=100, min=1,   max=1000)
+                ui.input_numeric("dl_lr",         "Learning Rate",       value=0.001, min=1e-5, max=1.0, step=0.0001)
+                ui.input_numeric("dl_dropout",    "Dropout Rate",        value=0.3,   min=0.0,  max=0.9, step=0.05)
+                ui.input_numeric("dl_batch_size", "Batch Size",          value=32,    min=4,    max=512)
+
+            with ui.layout_columns(col_widths=[4, 8]):
+                ui.input_numeric("dl_patience", "Early Stopping Patience (MLP)", value=10, min=1, max=100)
+                ui.div()   # spacer
+
+            ui.input_task_button(
+                "dl_train_btn",
+                "Train PyTorch Model",
+                class_="btn-success mt-2",
+            )
+
+        # Output panels
+        with ui.layout_columns(col_widths=[6, 6]):
+            with ui.card():
+                ui.card_header("Training Loss Curves")
+                @render.plot
+                def dl_loss_curves():
+                    res = dl_results()
+                    if res is None:
+                        return None
+                    return res.get("curves_fig")
+
+            with ui.card():
+                ui.card_header("VAE Latent Space Projection (PCA)")
+                @render.plot
+                def dl_latent_plot():
+                    res = dl_results()
+                    if res is None or res.get("model_type") != "vae":
+                        return None
+                    return res.get("latent_fig")
+
+        with ui.card():
+            ui.card_header("Model Evaluation")
+
+            @render.text
+            def dl_metrics_text():
+                res = dl_results()
+                if res is None:
+                    return "Train a model to see evaluation metrics."
+                mtype = res.get("model_type", "")
+                if mtype == "mlp":
+                    m = res.get("eval_metrics", {})
+                    loss = m.get("loss", float("nan"))
+                    acc  = m.get("accuracy", float("nan"))
+                    return f"Model: MLP Classifier\nValidation Loss: {loss:.4f}\nValidation Accuracy: {acc:.4f}"
+                elif mtype == "vae":
+                    h = None
+                    # Report last-epoch losses from training curves
+                    curves_fig = res.get("curves_fig")
+                    return "Model: VAE — see training curves for loss breakdown."
+                return "No metrics available."
+
+            @render.download(filename="pytorch_model.pt")
+            async def download_pt_model():
+                """Download the trained PyTorch model state dict as a .pt file."""
+                res = dl_results()
+                if res and res.get("model_bytes"):
+                    yield res["model_bytes"]
+
 
 # ---------------------------------------------------------------------------
-# Helper functions to extract outputs from reactive training_results
+# Helper functions — extract outputs from AutoML training_results
 # ---------------------------------------------------------------------------
 def _get_best_params(model_name: str) -> str:
     results = training_results() or []

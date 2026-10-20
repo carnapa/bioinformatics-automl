@@ -1,0 +1,33 @@
+name: bioinformatics-automl
+
+channels:
+  - pytorch        # PyTorch official channel (correct CUDA wheels)
+  - conda-forge    # gseapy, statsmodels, and most scientific packages
+  - defaults
+
+dependencies:
+  # --- Core data & ML stack ---
+  - python>=3.10
+  - pyyaml
+  - pandas
+  - numpy
+  - scipy
+  - statsmodels
+  - scikit-learn
+  - seaborn
+  - matplotlib
+  - joblib
+
+  # --- PyTorch (sourced from the pytorch channel) ---
+  - pytorch::pytorch
+  # Uncomment the line below to enable GPU support (pick your CUDA version):
+  # - pytorch::pytorch-cuda=12.1
+
+  # --- Bioinformatics ---
+  - conda-forge::gseapy
+
+  # --- Shiny web dashboard ---
+  - pip
+  - pip:
+    - shiny
+    - shinyswatch
